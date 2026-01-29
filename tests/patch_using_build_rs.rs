@@ -6,7 +6,7 @@ use std::fmt;
 
 #[cargo_test]
 fn patch_using_build_rs() {
-    let memchr_version = "2.7.4";
+    let memchr_version = "2.7.6";
     let manifest = format!(
         r#"
         [package]

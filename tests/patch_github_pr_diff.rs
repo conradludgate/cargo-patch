@@ -48,7 +48,7 @@ fn patch_file() {
         .as_str(),
     );
 
-    e.with_stdout("Patched serde: LICENSE-MIT").run();
+    e.with_stdout_data("Patched serde: LICENSE-MIT\n").run();
 
     let license_mit = p
         .build_dir()

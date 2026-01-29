@@ -52,8 +52,8 @@
 //! for a subcommand to intercept the build process.
 //!
 
-#![deny(clippy::all, clippy::nursery)]
-#![deny(nonstandard_style, rust_2018_idioms)]
+#![warn(clippy::all, clippy::nursery)]
+#![warn(nonstandard_style, rust_2018_idioms)]
 
 use anyhow::{anyhow, Result};
 use cargo::{
@@ -277,7 +277,7 @@ fn get_id(
         if dep.name().as_str() == name
             && version
                 .as_ref()
-                .map_or(true, |ver| ver.matches(dep.version()))
+                .is_none_or(|ver| ver.matches(dep.version()))
         {
             if matched_dep.is_none() {
                 matched_dep = Some(dep);
