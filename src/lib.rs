@@ -141,7 +141,6 @@ impl Display for PatchFailed {
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 fn clear_patch_folder() -> Result<()> {
     match fs::remove_dir_all("target/patch") {
         Ok(_) => Ok(()),
@@ -293,13 +292,12 @@ fn get_id(
 }
 
 fn copy_package(pkg: &Package) -> Result<PathBuf> {
-    fs::create_dir_all("target/patch/")?;
+    let patch_dir = Path::new("target/patch/");
+    fs::create_dir_all(patch_dir)?;
     let options = CopyOptions::new();
-    let _ = copy(pkg.root(), "target/patch/", &options)?;
+    let _ = copy(pkg.root(), patch_dir, &options)?;
     if let Some(name) = pkg.root().file_name() {
-        let buf = PathBuf::from("target/patch/");
-        let buf = buf.join(name).canonicalize()?;
-        Ok(buf)
+        Ok(patch_dir.join(name).canonicalize()?)
     } else {
         Err(anyhow!("Dependency Folder does not have a name"))
     }
@@ -345,6 +343,11 @@ fn do_patch(
     fs::write(&new_path, data)?;
 
     Ok(patch_type)
+}
+
+fn cleanup_package_dir(path: &Path, _package: &Package) -> Result<()> {
+    fs::remove_dir_all(path.join("target"))?;
+    Ok(())
 }
 
 fn apply_patches<'a>(
@@ -483,7 +486,6 @@ fn apply_patch(diff: Patch<'_>, old: &str) -> Result<String, u64> {
     Ok(out.join("\n"))
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 fn read_to_string(path: &Path) -> Result<String> {
     match fs::read_to_string(path) {
         Ok(data) => Ok(data),
@@ -520,6 +522,7 @@ pub fn patch() -> Result<()> {
     for (patch, id) in ids {
         let package = pkg_set.get_one(id)?;
         let path = copy_package(package)?;
+        cleanup_package_dir(&path, package)?;
         patched = true;
         apply_patches(patch.name, patch.patches.into_iter(), &path)?;
     }
