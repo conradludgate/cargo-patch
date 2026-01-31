@@ -346,7 +346,7 @@ fn do_patch(
 }
 
 fn cleanup_package_dir(path: &Path, _package: &Package) -> Result<()> {
-    fs::remove_dir_all(path.join("target"))?;
+    // delete any unused files?
     Ok(())
 }
 
