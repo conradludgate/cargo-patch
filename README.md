@@ -63,6 +63,45 @@ cargo-patch = "0.3"
 
 Note, however, that all your patches should be in a single folder called `patches` or something similar. This is to make sure that the build script is executed again when something changes.
 
+## Developing patches
+
+The `edit`, `diff`, and `save` subcommands provide a git-based workflow for creating and maintaining patches.
+
+### Creating patches
+
+```sh
+# Set up an editing environment with git branches
+cargo patch edit serde
+
+# Make changes in the crate source, then commit
+cd target/patch/serde-1.0.110
+# ... edit files ...
+git add -A && git commit -m "my-change"
+
+# Preview the diff from upstream
+cargo patch diff serde
+
+# Extract commits as .patch files and update Cargo.toml
+cargo patch save serde
+```
+
+`edit` creates a git repo in `target/patch/<name>-<version>/` with two branches:
+- **`upstream`**: tracks upstream release(s)
+- **`patched`**: forked from the base version, one commit per patch file
+
+### Upgrading to a newer version
+
+Use `--target` to download all intermediate versions onto the `upstream` branch, then rebase your patches forward:
+
+```sh
+cargo patch edit serde --target 1.0.200
+cd target/patch/serde-1.0.110
+git rebase --onto v1.0.200 v1.0.110 patched
+# resolve any conflicts with standard git tools
+cargo patch save serde
+# then update version and path in Cargo.toml
+```
+
 ## Patch format
 
 You can either use [diff](http://man7.org/linux/man-pages/man1/diff.1.html) or

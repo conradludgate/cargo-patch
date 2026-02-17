@@ -40,11 +40,45 @@
 //! serde = { path = './target/patch/serde-1.0.110' }
 //! ```
 //!
+//! # Developing patches
+//!
+//! The `edit`, `diff`, and `save` subcommands provide a git-based workflow
+//! for creating and maintaining patches.
+//!
+//! ```sh
+//! # Set up an editing environment with git branches
+//! cargo patch edit serde
+//!
+//! # Make changes in target/patch/serde-1.0.110/, commit them
+//! cd target/patch/serde-1.0.110
+//! # ... edit files ...
+//! git add -A && git commit -m "my-change"
+//!
+//! # Preview the diff
+//! cargo patch diff serde
+//!
+//! # Extract commits as .patch files and update Cargo.toml
+//! cargo patch save serde
+//! ```
+//!
+//! ## Version upgrades
+//!
+//! To upgrade a patched crate to a newer version, use `--target` to
+//! download intermediate versions onto an `upstream` branch, then rebase:
+//!
+//! ```sh
+//! cargo patch edit serde --target 1.0.200
+//! cd target/patch/serde-1.0.110
+//! git rebase --onto v1.0.200 v1.0.110 patched
+//! # resolve any conflicts, then:
+//! cargo patch save serde
+//! ```
+//!
 //! # Patch format
 //!
 //! You can either use [diff](http://man7.org/linux/man-pages/man1/diff.1.html) or
 //! [git](https://linux.die.net/man/1/git) to create patch files. Important is that
-//! file paths are relativ and inside the dependency
+//! file paths are relative and inside the dependency.
 //!
 //! # Limitations
 //!
@@ -55,7 +89,7 @@
 #![warn(clippy::all, clippy::nursery)]
 #![warn(nonstandard_style, rust_2018_idioms)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use cargo::{
     core::{
         package::{Package, PackageSet},
@@ -75,12 +109,17 @@ use fs_extra::dir::{copy, CopyOptions};
 use patch::{Line, Patch};
 use semver::VersionReq;
 use std::fmt::{Display, Formatter};
+use std::process::Command;
 use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
 use toml::Value;
+
+// ========================
+// Types
+// ========================
 
 #[derive(Debug, Clone, Default)]
 enum PatchSource {
@@ -100,6 +139,13 @@ struct PatchEntry<'a> {
     name: &'a str,
     version: Option<VersionReq>,
     patches: Vec<PatchItem<'a>>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedPatchEntry {
+    name: String,
+    version: Option<VersionReq>,
+    patch_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -140,6 +186,52 @@ impl Display for PatchFailed {
         )
     }
 }
+
+impl<'a> PatchEntry<'a> {
+    fn to_owned_entry(&self) -> OwnedPatchEntry {
+        OwnedPatchEntry {
+            name: self.name.to_string(),
+            version: self.version.clone(),
+            patch_paths: self.patches.iter().map(|p| p.path.to_path_buf()).collect(),
+        }
+    }
+}
+
+// ========================
+// Git helper
+// ========================
+
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !status.success() {
+        anyhow::bail!("git {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+// ========================
+// Workspace and metadata helpers
+// ========================
 
 fn clear_patch_folder() -> Result<()> {
     match fs::remove_dir_all("target/patch") {
@@ -291,6 +383,26 @@ fn get_id(
     matched_dep
 }
 
+fn find_patch_entry_owned(workspace: &Workspace<'_>, crate_name: &str) -> Option<OwnedPatchEntry> {
+    let custom_metadata = workspace.custom_metadata().into_iter().chain(
+        workspace
+            .members()
+            .flat_map(|member| member.manifest().custom_metadata()),
+    );
+    custom_metadata
+        .flat_map(get_patches)
+        .find(|e| e.name == crate_name)
+        .map(|e| e.to_owned_entry())
+}
+
+fn find_patch_dir(crate_name: &str, version: &semver::Version) -> PathBuf {
+    PathBuf::from(format!("target/patch/{crate_name}-{version}"))
+}
+
+// ========================
+// Package copying
+// ========================
+
 fn copy_package(pkg: &Package) -> Result<PathBuf> {
     let patch_dir = Path::new("target/patch/");
     fs::create_dir_all(patch_dir)?;
@@ -302,6 +414,137 @@ fn copy_package(pkg: &Package) -> Result<PathBuf> {
         Err(anyhow!("Dependency Folder does not have a name"))
     }
 }
+
+// ========================
+// Crate downloading (for --target)
+// ========================
+
+fn download_crate_archive(name: &str, version: &semver::Version) -> Result<Vec<u8>> {
+    let url = format!("https://crates.io/api/v1/crates/{name}/{version}/download");
+    let mut easy = curl::easy::Easy::new();
+    easy.url(&url)?;
+    easy.follow_location(true)?;
+    easy.useragent("cargo-patch")?;
+    let mut data = Vec::new();
+    {
+        let mut transfer = easy.transfer();
+        transfer.write_function(|d| {
+            data.extend_from_slice(d);
+            Ok(d.len())
+        })?;
+        transfer.perform()?;
+    }
+    Ok(data)
+}
+
+fn extract_crate_to(archive_data: &[u8], dest: &Path) -> Result<()> {
+    let decoder = flate2::read::GzDecoder::new(archive_data);
+    let mut archive = tar::Archive::new(decoder);
+
+    let temp_dir = dest.with_extension("_extract_tmp");
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+    }
+    fs::create_dir_all(&temp_dir)?;
+
+    archive.unpack(&temp_dir)?;
+
+    // The archive contains a top-level directory like "serde-1.0.110/"
+    // Find it and move its contents to dest
+    let mut entries = fs::read_dir(&temp_dir)?;
+    let top_dir = entries
+        .next()
+        .ok_or_else(|| anyhow!("Empty crate archive"))??
+        .path();
+
+    // Remove old contents of dest (except .git)
+    if dest.exists() {
+        for entry in fs::read_dir(dest)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name != ".git" {
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path)?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+            }
+        }
+    } else {
+        fs::create_dir_all(dest)?;
+    }
+
+    // Copy contents from extracted dir to dest
+    for entry in fs::read_dir(&top_dir)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = dest.join(entry.file_name());
+        if src.is_dir() {
+            let options = CopyOptions::new();
+            copy(&src, dest, &options)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+    }
+
+    fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+fn query_crate_versions(
+    name: &str,
+    from: &semver::Version,
+    to: &semver::Version,
+) -> Result<Vec<semver::Version>> {
+    let url = format!("https://crates.io/api/v1/crates/{name}/versions");
+    let mut easy = curl::easy::Easy::new();
+    easy.url(&url)?;
+    easy.follow_location(true)?;
+    easy.useragent("cargo-patch")?;
+    let mut data = Vec::new();
+    {
+        let mut transfer = easy.transfer();
+        transfer.write_function(|d| {
+            data.extend_from_slice(d);
+            Ok(d.len())
+        })?;
+        transfer.perform()?;
+    }
+
+    // Parse the JSON response to extract version numbers
+    // The response has: { "versions": [ { "num": "1.0.0", "yanked": false, ... }, ... ] }
+    let json: serde_json::Value =
+        serde_json::from_slice(&data).context("Failed to parse crates.io response")?;
+
+    let versions = json["versions"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Unexpected crates.io response format"))?;
+
+    let mut result: Vec<semver::Version> = versions
+        .iter()
+        .filter_map(|v| {
+            let yanked = v["yanked"].as_bool().unwrap_or(true);
+            if yanked {
+                return None;
+            }
+            let num = v["num"].as_str()?;
+            let ver = semver::Version::parse(num).ok()?;
+            if ver > *from && ver <= *to {
+                Some(ver)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    result.sort();
+    Ok(result)
+}
+
+// ========================
+// Patch application
+// ========================
 
 fn do_patch(
     diff: Patch<'_>,
@@ -345,7 +588,7 @@ fn do_patch(
     Ok(patch_type)
 }
 
-fn cleanup_package_dir(path: &Path, _package: &Package) -> Result<()> {
+fn cleanup_package_dir(_path: &Path, _package: &Package) -> Result<()> {
     // delete any unused files?
     Ok(())
 }
@@ -498,6 +741,11 @@ fn read_to_string(path: &Path) -> Result<String> {
     }
 }
 
+/// Download patched crate sources and apply patch files.
+///
+/// Reads patch configuration from `[package.metadata.patch.*]` or
+/// `[workspace.metadata.patch.*]` in Cargo.toml, downloads each crate
+/// to `target/patch/<name>-<version>/`, and applies the listed patches.
 pub fn patch() -> Result<()> {
     clear_patch_folder()?;
     let gctx = setup_gctx()?;
@@ -532,6 +780,376 @@ pub fn patch() -> Result<()> {
     }
     Ok(())
 }
+
+/// Set up a git-based editing environment for developing patches.
+///
+/// Creates a git repo in `target/patch/<name>-<version>/` with two branches:
+/// - `upstream`: linear history of upstream releases (one commit per version)
+/// - `patched`: forked from the base version, with one commit per existing patch
+///
+/// If `target` is specified, downloads all intermediate crate versions between
+/// the current version and the target, committing each to the `upstream` branch.
+/// You can then `git rebase --onto v<target> v<base> patched` to port patches
+/// forward.
+pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
+    let gctx = setup_gctx()?;
+    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
+    let workspace_path = find_cargo_toml(&PathBuf::from("."))?;
+    let workspace = fetch_workspace(&gctx, &workspace_path)?;
+    let (pkg_set, resolve) = resolve_ws(&workspace)?;
+
+    let entry = find_patch_entry_owned(&workspace, crate_name)
+        .ok_or_else(|| anyhow!("No patch entry found for '{crate_name}' in Cargo.toml metadata"))?;
+
+    let pkg_id = get_id(crate_name, &entry.version, &resolve)
+        .ok_or_else(|| anyhow!("Package '{crate_name}' not found in resolved dependencies"))?;
+    let package = pkg_set.get_one(pkg_id)?;
+    let base_version = package.version().clone();
+    let patch_dir = find_patch_dir(crate_name, &base_version);
+
+    // Remove existing patch dir if present
+    if patch_dir.exists() {
+        fs::remove_dir_all(&patch_dir)?;
+    }
+
+    // Copy package source to patch dir
+    let path = copy_package(package)?;
+    cleanup_package_dir(&path, package)?;
+
+    // Initialize git repo with a default identity for commits
+    git(&path, &["init"])?;
+    git(&path, &["config", "user.name", "cargo-patch"])?;
+    git(&path, &["config", "user.email", "cargo-patch@localhost"])?;
+    git(&path, &["add", "-A"])?;
+    git(
+        &path,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("{crate_name} {base_version}"),
+        ],
+    )?;
+    git(&path, &["tag", &format!("v{base_version}")])?;
+
+    // If --target specified, populate upstream branch with intermediate versions
+    let target_version = if let Some(target_str) = target {
+        let target_ver =
+            semver::Version::parse(target_str).context("Invalid target version")?;
+
+        println!(
+            "Querying versions between {base_version} and {target_ver}..."
+        );
+        let versions = query_crate_versions(crate_name, &base_version, &target_ver)?;
+
+        for ver in &versions {
+            println!("Downloading {crate_name} {ver}...");
+            let archive = download_crate_archive(crate_name, ver)?;
+            extract_crate_to(&archive, &path)?;
+            git(&path, &["add", "-A"])?;
+            git(
+                &path,
+                &["commit", "--allow-empty", "-m", &format!("{crate_name} {ver}")],
+            )?;
+            git(&path, &["tag", &format!("v{ver}")])?;
+        }
+
+        Some(target_ver)
+    } else {
+        None
+    };
+
+    // Create upstream branch at current HEAD
+    git(&path, &["checkout", "-b", "upstream"])?;
+
+    // Create patched branch from base version
+    git(
+        &path,
+        &["checkout", "-b", "patched", &format!("v{base_version}")],
+    )?;
+
+    // Apply existing patches as individual commits
+    for patch_path in &entry.patch_paths {
+        let patch_name = patch_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "patch".to_string());
+
+        let patch_item = PatchItem {
+            path: patch_path,
+            source: PatchSource::Default,
+        };
+
+        match apply_patches(crate_name, std::iter::once(patch_item), &path) {
+            Ok(()) => {
+                git(&path, &["add", "-A"])?;
+                git(&path, &["commit", "--allow-empty", "-m", &patch_name])?;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to apply patch '{patch_name}': {e}");
+                // Reset any partial changes
+                git(&path, &["checkout", "."])?;
+                git(&path, &["clean", "-fd"])?;
+            }
+        }
+    }
+
+    println!();
+    println!("Edit environment created at: {}", path.display());
+    println!("  Branch 'patched' is checked out with existing patches applied.");
+    println!("  Branch 'upstream' points to the latest upstream version.");
+    println!();
+
+    if let Some(target_ver) = &target_version {
+        println!("To rebase patches onto v{target_ver}:");
+        println!(
+            "  cd {} && git rebase --onto v{target_ver} v{base_version} patched",
+            path.display()
+        );
+        println!();
+    }
+
+    println!("After editing, use 'cargo patch save {crate_name}' to extract patches.");
+    Ok(())
+}
+
+/// Show the diff between the upstream base and the current patched state.
+///
+/// Finds the merge-base between HEAD and the `upstream` branch, then runs
+/// `git diff` to show all changes (including uncommitted work).
+/// If no crate name is given, diffs all configured patched crates.
+pub fn diff(crate_name: Option<&str>) -> Result<()> {
+    let gctx = setup_gctx()?;
+    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
+    let workspace_path = find_cargo_toml(&PathBuf::from("."))?;
+    let workspace = fetch_workspace(&gctx, &workspace_path)?;
+    let (_, resolve) = resolve_ws(&workspace)?;
+
+    let entries: Vec<OwnedPatchEntry> = if let Some(name) = crate_name {
+        let entry = find_patch_entry_owned(&workspace, name)
+            .ok_or_else(|| anyhow!("No patch entry found for '{name}'"))?;
+        vec![entry]
+    } else {
+        let custom_metadata = workspace.custom_metadata().into_iter().chain(
+            workspace
+                .members()
+                .flat_map(|member| member.manifest().custom_metadata()),
+        );
+        custom_metadata
+            .flat_map(get_patches)
+            .map(|e| e.to_owned_entry())
+            .collect()
+    };
+
+    for entry in &entries {
+        let pkg_id = get_id(&entry.name, &entry.version, &resolve);
+        let version = pkg_id
+            .map(|id| id.version().clone())
+            .ok_or_else(|| anyhow!("Package '{}' not found in dependencies", entry.name))?;
+
+        let patch_dir = find_patch_dir(&entry.name, &version);
+        if !patch_dir.join(".git").exists() {
+            eprintln!(
+                "No edit environment found at {}. Run 'cargo patch edit {}' first.",
+                patch_dir.display(),
+                entry.name
+            );
+            continue;
+        }
+
+        let base = git(&patch_dir, &["merge-base", "HEAD", "upstream"])?;
+        let base = base.trim();
+        git_stdout(&patch_dir, &["diff", base])?;
+    }
+
+    Ok(())
+}
+
+/// Extract patch commits as `.patch` files and update Cargo.toml.
+///
+/// Commits any uncommitted changes, then iterates over all commits on `patched`
+/// since the upstream base. Each commit is exported as a unified diff (with
+/// `--no-prefix`) and written to the patch directory. The `patches` list in
+/// Cargo.toml metadata is updated to reference the new files.
+pub fn save(crate_name: &str) -> Result<()> {
+    let gctx = setup_gctx()?;
+    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
+    let workspace_path = find_cargo_toml(&PathBuf::from("."))?;
+    let workspace = fetch_workspace(&gctx, &workspace_path)?;
+    let (_, resolve) = resolve_ws(&workspace)?;
+
+    let entry = find_patch_entry_owned(&workspace, crate_name)
+        .ok_or_else(|| anyhow!("No patch entry found for '{crate_name}'"))?;
+
+    let pkg_id = get_id(crate_name, &entry.version, &resolve)
+        .ok_or_else(|| anyhow!("Package '{crate_name}' not found in dependencies"))?;
+    let version = pkg_id.version().clone();
+
+    let patch_dir = find_patch_dir(crate_name, &version);
+    if !patch_dir.join(".git").exists() {
+        anyhow::bail!(
+            "No edit environment found at {}. Run 'cargo patch edit {crate_name}' first.",
+            patch_dir.display()
+        );
+    }
+
+    // Commit any uncommitted changes
+    let status = git(&patch_dir, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        git(&patch_dir, &["add", "-A"])?;
+        git(&patch_dir, &["commit", "-m", "wip"])?;
+    }
+
+    // Find the upstream base (merge-base of HEAD and upstream branch)
+    let base = git(&patch_dir, &["merge-base", "HEAD", "upstream"])?;
+    let base = base.trim();
+
+    // List commits from base to HEAD
+    let log_output = git(
+        &patch_dir,
+        &["log", "--reverse", "--format=%H %s", &format!("{base}..HEAD")],
+    )?;
+
+    let commits: Vec<(&str, &str)> = log_output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect();
+
+    if commits.is_empty() {
+        println!("No patch commits found.");
+        return Ok(());
+    }
+
+    // Determine output directory from existing patch paths, or use a default
+    let output_dir = entry
+        .patch_paths
+        .first()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(format!("patches/{crate_name}-{version}")));
+
+    fs::create_dir_all(&output_dir)?;
+
+    // Clean old patch files in the directory
+    if output_dir.exists() {
+        for entry_file in fs::read_dir(&output_dir)? {
+            let entry_file = entry_file?;
+            if entry_file.path().extension().is_some_and(|e| e == "patch") {
+                fs::remove_file(entry_file.path())?;
+            }
+        }
+    }
+
+    let mut patch_filenames = Vec::new();
+    for (i, (hash, subject)) in commits.iter().enumerate() {
+        // Sanitize the commit message for use as a filename
+        let safe_name: String = subject
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        let filename = format!("{:04}-{safe_name}.patch", i + 1);
+        let patch_path = output_dir.join(&filename);
+
+        // Generate unified diff for this commit
+        let diff_output = git(&patch_dir, &["diff", "--no-prefix", &format!("{hash}~1"), hash])?;
+        fs::write(&patch_path, &diff_output)?;
+
+        println!("Saved: {}", patch_path.display());
+        patch_filenames.push(
+            output_dir
+                .join(&filename)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+
+    // Update Cargo.toml metadata
+    update_cargo_toml_patches(crate_name, &patch_filenames)?;
+
+    println!();
+    println!(
+        "Saved {} patch(es) to {}",
+        patch_filenames.len(),
+        output_dir.display()
+    );
+    println!("Updated patches list in Cargo.toml.");
+    Ok(())
+}
+
+fn update_cargo_toml_patches(crate_name: &str, patch_files: &[String]) -> Result<()> {
+    let cargo_toml_path = find_cargo_toml(&PathBuf::from("."))?;
+    let content = fs::read_to_string(&cargo_toml_path)?;
+
+    // Build the new patches array as a TOML fragment
+    let mut new_array = String::from("[\n");
+    for f in patch_files {
+        new_array.push_str(&format!("    \"{f}\",\n"));
+    }
+    new_array.push(']');
+
+    // Try to find and replace the patches array in the metadata section for this crate.
+    // We look for a line with `patches = [` inside the right section and replace
+    // everything from `[` to the matching `]`.
+    let section_markers = [
+        format!("[workspace.metadata.patch.{crate_name}]"),
+        format!("[package.metadata.patch.{crate_name}]"),
+    ];
+
+    let mut updated = false;
+    let mut result = String::new();
+    let mut in_target_section = false;
+    let mut in_patches_array = false;
+    let mut bracket_depth = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Detect section headers
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            in_target_section = section_markers.iter().any(|m| trimmed == m);
+        }
+
+        if in_target_section && !in_patches_array && trimmed.starts_with("patches") {
+            // Found the patches key - replace with new value
+            result.push_str(&format!("patches = {new_array}\n"));
+            updated = true;
+            // Skip until we find the closing bracket of the old array
+            if trimmed.contains('[') {
+                bracket_depth = trimmed.matches('[').count() as i32
+                    - trimmed.matches(']').count() as i32;
+                if bracket_depth > 0 {
+                    in_patches_array = true;
+                }
+            }
+            continue;
+        }
+
+        if in_patches_array {
+            bracket_depth += trimmed.matches('[').count() as i32;
+            bracket_depth -= trimmed.matches(']').count() as i32;
+            if bracket_depth <= 0 {
+                in_patches_array = false;
+            }
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if !updated {
+        anyhow::bail!(
+            "Could not find patches array in [*.metadata.patch.{crate_name}] section of Cargo.toml"
+        );
+    }
+
+    fs::write(&cargo_toml_path, result)?;
+    Ok(())
+}
+
+// ========================
+// Tests
+// ========================
 
 #[cfg(test)]
 mod tests {
