@@ -58,7 +58,9 @@ fn patch_crates_io_missing_patch() {
         .build();
 
     p.process(common::cargo_patch_exe())
-        .with_stderr_data("Error: Unable to find patch file with path: \"test.patch\"\n")
+        .with_stderr_data(
+            "Error: Unable to find patch file with path: \"test.patch\"\n",
+        )
         .with_status(1)
         .run();
 }

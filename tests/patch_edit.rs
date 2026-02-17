@@ -18,6 +18,12 @@ const PATCH_CONTENT: &str = r#"--- LICENSE-MIT	2020-05-20 18:44:09.709027472 +02
  ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
 "#;
 
+fn edit_cmd(p: &cargo_test_support::Project) -> cargo_test_support::Execs {
+    let mut e = p.process(common::cargo_patch_exe());
+    e.arg("edit").cwd(p.root()).env("CARGO_PATCH_NO_SHELL", "1");
+    e
+}
+
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
@@ -50,6 +56,7 @@ fn edit_creates_git_repo() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = [
             "test.patch"
         ]
@@ -60,11 +67,7 @@ fn edit_creates_git_repo() {
         .file("test.patch", PATCH_CONTENT)
         .build();
 
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     let patch_dir = p.build_dir().join("patch").join("serde-1.0.110");
 
@@ -113,6 +116,7 @@ fn edit_no_existing_patches() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = []
     "#;
     let p = project()
@@ -120,11 +124,7 @@ fn edit_no_existing_patches() {
         .file("src/main.rs", &main_file(r#""i am foo""#, &[]))
         .build();
 
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     let patch_dir = p.build_dir().join("patch").join("serde-1.0.110");
     assert!(patch_dir.join(".git").exists());
@@ -152,6 +152,7 @@ fn diff_shows_changes() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = []
     "#;
     let p = project()
@@ -159,12 +160,7 @@ fn diff_shows_changes() {
         .file("src/main.rs", &main_file(r#""i am foo""#, &[]))
         .build();
 
-    // First set up the edit environment
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     // Make a modification
     let patch_dir = p.build_dir().join("patch").join("serde-1.0.110");
@@ -193,6 +189,7 @@ fn diff_shows_nothing_when_clean() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = []
     "#;
     let p = project()
@@ -200,11 +197,7 @@ fn diff_shows_nothing_when_clean() {
         .file("src/main.rs", &main_file(r#""i am foo""#, &[]))
         .build();
 
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     // Diff should produce no output when nothing has changed
     p.process(common::cargo_patch_exe())
@@ -232,6 +225,7 @@ fn save_creates_per_commit_patches() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = [
             "test.patch"
         ]
@@ -242,12 +236,7 @@ fn save_creates_per_commit_patches() {
         .file("test.patch", PATCH_CONTENT)
         .build();
 
-    // Set up edit environment (applies existing patch as first commit)
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     // Make another edit and commit it
     let patch_dir = p.build_dir().join("patch").join("serde-1.0.110");
@@ -267,11 +256,7 @@ fn save_creates_per_commit_patches() {
     let patch_files: Vec<_> = std::fs::read_dir(p.root())
         .expect("read dir")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "patch")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
         .collect();
 
     // The patches go to the directory of the first configured patch path.
@@ -297,6 +282,7 @@ fn save_round_trip() {
         serde = "=1.0.110"
 
         [package.metadata.patch.serde]
+        version = "1.0.110"
         patches = []
     "#;
     let p = project()
@@ -304,12 +290,7 @@ fn save_round_trip() {
         .file("src/main.rs", &main_file(r#""i am foo""#, &[]))
         .build();
 
-    // Set up edit environment
-    p.process(common::cargo_patch_exe())
-        .arg("edit")
-        .arg("serde")
-        .cwd(p.root())
-        .run();
+    edit_cmd(&p).arg("serde").run();
 
     // Make an edit and commit
     let patch_dir = p.build_dir().join("patch").join("serde-1.0.110");
@@ -329,9 +310,7 @@ fn save_round_trip() {
     std::fs::remove_dir_all(&patch_dir).expect("remove");
 
     // Run plain `cargo patch` (apply) - this should apply the saved patches
-    p.process(common::cargo_patch_exe())
-        .cwd(p.root())
-        .run();
+    p.process(common::cargo_patch_exe()).cwd(p.root()).run();
 
     // Verify the result matches our edit
     let applied = std::fs::read_to_string(&license).expect("read after apply");

@@ -9,7 +9,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum PatchCommand {
-    /// Set up a git-based editing environment for developing patches
+    /// Set up a git-based editing environment and open a subshell in it
     Edit {
         /// Name of the crate to edit (must be configured in Cargo.toml metadata)
         crate_name: String,

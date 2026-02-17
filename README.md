@@ -70,13 +70,12 @@ The `edit`, `diff`, and `save` subcommands provide a git-based workflow for crea
 ### Creating patches
 
 ```sh
-# Set up an editing environment with git branches
+# Opens a subshell in the patch directory with git branches set up
 cargo patch edit serde
 
-# Make changes in the crate source, then commit
-cd target/patch/serde-1.0.110
-# ... edit files ...
+# Inside the subshell: edit files, commit changes
 git add -A && git commit -m "my-change"
+exit
 
 # Preview the diff from upstream
 cargo patch diff serde
@@ -85,7 +84,8 @@ cargo patch diff serde
 cargo patch save serde
 ```
 
-`edit` creates a git repo in `target/patch/<name>-<version>/` with two branches:
+`edit` creates a git repo in `target/patch/<name>-<version>/` and drops you
+into a subshell there. The repo has two branches:
 - **`upstream`**: tracks upstream release(s)
 - **`patched`**: forked from the base version, one commit per patch file
 
@@ -94,10 +94,14 @@ cargo patch save serde
 Use `--target` to download all intermediate versions onto the `upstream` branch, then rebase your patches forward:
 
 ```sh
+# Drops into a subshell; rebase instructions are printed
 cargo patch edit serde --target 1.0.200
-cd target/patch/serde-1.0.110
+
+# Inside the subshell:
 git rebase --onto v1.0.200 v1.0.110 patched
-# resolve any conflicts with standard git tools
+# resolve any conflicts, then exit the shell
+exit
+
 cargo patch save serde
 # then update version and path in Cargo.toml
 ```

@@ -47,7 +47,8 @@ fn patch_create_file() {
 "#,
     );
 
-    e.with_stdout_data("Patched serde: /dev/null -> test.txt\n").run();
+    e.with_stdout_data("Patched serde: /dev/null -> test.txt\n")
+        .run();
 
     let file = p.build_dir().join("patch").join("serde").join("test.txt");
 
