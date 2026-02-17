@@ -94,23 +94,16 @@
 
 use anyhow::{anyhow, Context, Result};
 use cargo::{
-    core::{
-        package::{Package, PackageSet},
-        registry::PackageRegistry,
-        resolver::{features::CliFeatures, HasDevUnits},
-        shell::Verbosity,
-        PackageId, Resolve, Workspace,
+    core::{shell::Verbosity, SourceId},
+    sources::{
+        source::{QueryKind, SourceMap},
+        SourceConfigMap,
     },
-    ops::{get_resolved_packages, load_pkg_lockfile, resolve_with_previous},
-    util::important_paths::find_root_manifest_for_wd,
+    util::{cache_lock::CacheLockMode::DownloadExclusive, important_paths::find_root_manifest_for_wd},
     GlobalContext,
 };
-
-use cargo::sources::SourceConfigMap;
-use cargo::util::cache_lock::CacheLockMode::DownloadExclusive;
 use fs_extra::dir::{copy, CopyOptions};
 use patch::{Line, Patch};
-use semver::VersionReq;
 use std::fmt::{Display, Formatter};
 use std::process::Command;
 use std::{
@@ -135,13 +128,6 @@ enum PatchSource {
 struct PatchItem<'a> {
     path: &'a Path,
     source: PatchSource,
-}
-
-#[derive(Debug, Clone)]
-struct PatchEntry<'a> {
-    name: &'a str,
-    version: Option<VersionReq>,
-    patches: Vec<PatchItem<'a>>,
 }
 
 /// Lightweight patch config parsed directly from Cargo.toml metadata,
@@ -263,144 +249,9 @@ fn clear_patch_folder() -> Result<()> {
     }
 }
 
-fn setup_gctx() -> Result<GlobalContext> {
-    let gctx = GlobalContext::default()?;
-    gctx.shell().set_verbosity(Verbosity::Quiet);
-    Ok(gctx)
-}
-
 fn find_cargo_toml(path: &Path) -> Result<PathBuf> {
     let path = fs::canonicalize(path)?;
     find_root_manifest_for_wd(&path)
-}
-
-fn fetch_workspace<'gctx>(
-    gctx: &'gctx GlobalContext,
-    path: &Path,
-) -> Result<Workspace<'gctx>> {
-    Workspace::new(path, gctx)
-}
-
-fn resolve_ws<'a>(ws: &Workspace<'a>) -> Result<(PackageSet<'a>, Resolve)> {
-    let scm = SourceConfigMap::new(ws.gctx())?;
-    let mut registry = PackageRegistry::new_with_source_config(ws.gctx(), scm)?;
-
-    registry.lock_patches();
-    let resolve = {
-        let prev = load_pkg_lockfile(ws)?;
-        let resolve: Resolve = resolve_with_previous(
-            &mut registry,
-            ws,
-            &CliFeatures::new_all(true),
-            HasDevUnits::No,
-            prev.as_ref(),
-            None,
-            &[],
-            false,
-        )?;
-        resolve
-    };
-    let packages = get_resolved_packages(&resolve, registry)?;
-    Ok((packages, resolve))
-}
-
-fn get_patches(
-    custom_metadata: &Value,
-) -> impl Iterator<Item = PatchEntry<'_>> + '_ {
-    custom_metadata
-        .as_table()
-        .and_then(|table| table.get("patch"))
-        .into_iter()
-        .flat_map(|patch| patch.as_table().into_iter())
-        .flat_map(|table| {
-            table
-                .into_iter()
-                .filter_map(|(k, v)| parse_patch_entry(k, v))
-        })
-}
-
-fn parse_patch_entry<'a>(name: &'a str, entry: &'a Value) -> Option<PatchEntry<'a>> {
-    let entry = entry.as_table().or_else(|| {
-        eprintln!("Entry {name} must contain a table.");
-        None
-    })?;
-
-    let version = entry.get("version").and_then(|version| {
-        let value = version.as_str().and_then(|s| VersionReq::parse(s).ok());
-        if value.is_none() {
-            eprintln!("Version must be a value semver string: {version}");
-        }
-        value
-    });
-
-    let patches = entry
-        .get("patches")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flat_map(|patches| {
-            patches.iter().flat_map(|patch| {
-                let item = if patch.is_str() {
-                    Some((patch.as_str(), Default::default()))
-                } else {
-                    patch.as_table().map(
-                        |it| (
-                            it.get("path").and_then(Value::as_str),
-                            it.get("source").and_then(Value::as_str)
-                              .map_or_else(Default::default, PatchSource::from_str)
-                        ))
-                };
-
-                let (path, source) = if let Some(item) = item {item } else {
-                    eprintln!("Patch Entry must be a string or a table with path and source: {patch}");
-                    return None;
-                };
-
-                let path = path.map(Path::new);
-                let path = if let Some(path) = path {
-                    path
-                } else {
-                    eprintln!("Patch Entry must be a string or a table with path and source: {patch}");
-                    return None;
-                };
-
-                Some(PatchItem {
-                    path,
-                    source,
-                })
-            })
-        })
-        .collect();
-
-    Some(PatchEntry {
-        name,
-        version,
-        patches,
-    })
-}
-
-fn get_id(
-    name: &str,
-    version: &Option<VersionReq>,
-    resolve: &Resolve,
-) -> Option<PackageId> {
-    let mut matched_dep = None;
-    for dep in resolve.iter() {
-        if dep.name().as_str() == name
-            && version
-                .as_ref()
-                .is_none_or(|ver| ver.matches(dep.version()))
-        {
-            if matched_dep.is_none() {
-                matched_dep = Some(dep);
-            } else {
-                eprintln!("There are multiple versions of {name} available. Try specifying a version.");
-            }
-        }
-    }
-    if matched_dep.is_none() {
-        eprintln!("Unable to find package {name} in dependencies");
-    }
-    matched_dep
 }
 
 fn find_patch_dir(crate_name: &str, version: &semver::Version) -> PathBuf {
@@ -448,9 +299,7 @@ fn parse_patch_config(name: &str, entry: &Value) -> Option<PatchConfig> {
                 let path_str = if v.is_str() {
                     v.as_str()
                 } else {
-                    v.as_table()
-                        .and_then(|t| t.get("path"))
-                        .and_then(Value::as_str)
+                    v.as_table().and_then(|t| t.get("path")).and_then(Value::as_str)
                 };
                 path_str.map(PathBuf::from)
             })
@@ -468,75 +317,113 @@ fn read_patch_config_for(crate_name: &str) -> Result<PatchConfig> {
     read_patch_configs()?
         .into_iter()
         .find(|c| c.name == crate_name)
-        .ok_or_else(|| {
-            anyhow!("No patch entry found for '{crate_name}' in Cargo.toml metadata")
-        })
+        .ok_or_else(|| anyhow!("No patch entry found for '{crate_name}' in Cargo.toml metadata"))
 }
 
 // ========================
-// Package copying
+// Crate source resolution
 // ========================
 
-fn copy_package(pkg: &Package) -> Result<PathBuf> {
+fn setup_gctx() -> Result<GlobalContext> {
+    let gctx = GlobalContext::default()?;
+    gctx.shell().set_verbosity(Verbosity::Quiet);
+    Ok(gctx)
+}
+
+/// Fetch crates from the cargo registry (using the local cache) and copy them
+/// into `target/patch/<name>-<version>/`.
+fn fetch_crates(
+    gctx: &GlobalContext,
+    configs: &[PatchConfig],
+) -> Result<()> {
+    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
+    let source_id = SourceId::crates_io(gctx)?;
+    let scm = SourceConfigMap::new(gctx)?;
+    let mut source = scm.load(source_id, &Default::default())?;
+
+    let mut pkg_ids = Vec::new();
+    for config in configs {
+        let dep = cargo::core::Dependency::parse(
+            config.name.as_str(),
+            Some(&format!("={}", config.version)),
+            source_id,
+        )?;
+        loop {
+            match source.query_vec(&dep, QueryKind::Exact)? {
+                std::task::Poll::Ready(summaries) => {
+                    let summary = summaries
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow!("{}@{} not found in registry", config.name, config.version)
+                        })?;
+                    pkg_ids.push(summary.package_id());
+                    break;
+                }
+                std::task::Poll::Pending => source.block_until_ready()?,
+            }
+        }
+    }
+
+    let mut source_map = SourceMap::new();
+    source_map.insert(source);
+    let pkg_set =
+        cargo::core::PackageSet::new(&pkg_ids, source_map, gctx)?;
+
     let patch_dir = Path::new("target/patch/");
     fs::create_dir_all(patch_dir)?;
-    let options = CopyOptions::new();
-    let _ = copy(pkg.root(), patch_dir, &options)?;
-    if let Some(name) = pkg.root().file_name() {
-        Ok(patch_dir.join(name).canonicalize()?)
-    } else {
-        Err(anyhow!("Dependency Folder does not have a name"))
+
+    for pkg_id in &pkg_ids {
+        let pkg = pkg_set.get_one(*pkg_id)?;
+        let options = CopyOptions::new();
+        copy(pkg.root(), patch_dir, &options)?;
     }
+
+    Ok(())
 }
 
-// ========================
-// Crate downloading (for --target)
-// ========================
+/// Fetch a single crate version via cargo's registry and copy its source
+/// into `dest`, preserving any existing `.git` directory.
+fn fetch_crate_to(
+    gctx: &GlobalContext,
+    name: &str,
+    version: &semver::Version,
+    dest: &Path,
+) -> Result<()> {
+    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
+    let source_id = SourceId::crates_io(gctx)?;
+    let scm = SourceConfigMap::new(gctx)?;
+    let mut source = scm.load(source_id, &Default::default())?;
 
-fn download_crate_archive(name: &str, version: &semver::Version) -> Result<Vec<u8>> {
-    let url = format!("https://crates.io/api/v1/crates/{name}/{version}/download");
-    let mut easy = curl::easy::Easy::new();
-    easy.url(&url)?;
-    easy.follow_location(true)?;
-    easy.useragent("cargo-patch")?;
-    let mut data = Vec::new();
-    {
-        let mut transfer = easy.transfer();
-        transfer.write_function(|d| {
-            data.extend_from_slice(d);
-            Ok(d.len())
-        })?;
-        transfer.perform()?;
-    }
-    Ok(data)
-}
+    let dep = cargo::core::Dependency::parse(
+        name,
+        Some(&format!("={version}")),
+        source_id,
+    )?;
+    let pkg_id = loop {
+        match source.query_vec(&dep, QueryKind::Exact)? {
+            std::task::Poll::Ready(summaries) => {
+                break summaries
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("{name}@{version} not found in registry"))?
+                    .package_id();
+            }
+            std::task::Poll::Pending => source.block_until_ready()?,
+        }
+    };
 
-fn extract_crate_to(archive_data: &[u8], dest: &Path) -> Result<()> {
-    let decoder = flate2::read::GzDecoder::new(archive_data);
-    let mut archive = tar::Archive::new(decoder);
-
-    let temp_dir = dest.with_extension("_extract_tmp");
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)?;
-    }
-    fs::create_dir_all(&temp_dir)?;
-
-    archive.unpack(&temp_dir)?;
-
-    // The archive contains a top-level directory like "serde-1.0.110/"
-    // Find it and move its contents to dest
-    let mut entries = fs::read_dir(&temp_dir)?;
-    let top_dir = entries
-        .next()
-        .ok_or_else(|| anyhow!("Empty crate archive"))??
-        .path();
+    let mut source_map = SourceMap::new();
+    source_map.insert(source);
+    let pkg_set = cargo::core::PackageSet::new(&[pkg_id], source_map, gctx)?;
+    let pkg = pkg_set.get_one(pkg_id)?;
+    let src = pkg.root();
 
     // Remove old contents of dest (except .git)
     if dest.exists() {
         for entry in fs::read_dir(dest)? {
             let entry = entry?;
-            let name = entry.file_name();
-            if name != ".git" {
+            if entry.file_name() != ".git" {
                 let path = entry.path();
                 if path.is_dir() {
                     fs::remove_dir_all(&path)?;
@@ -549,67 +436,62 @@ fn extract_crate_to(archive_data: &[u8], dest: &Path) -> Result<()> {
         fs::create_dir_all(dest)?;
     }
 
-    // Copy contents from extracted dir to dest
-    for entry in fs::read_dir(&top_dir)? {
+    // Copy source files into dest
+    for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let src = entry.path();
-        let dst = dest.join(entry.file_name());
-        if src.is_dir() {
+        let src_path = entry.path();
+        if src_path.is_dir() {
             let options = CopyOptions::new();
-            copy(&src, dest, &options)?;
+            copy(&src_path, dest, &options)?;
         } else {
-            fs::copy(&src, &dst)?;
+            fs::copy(&src_path, dest.join(entry.file_name()))?;
         }
     }
 
-    fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }
 
+/// Look up a crate in the sparse index, fetching from the remote index on cache miss.
+fn sparse_index_lookup(name: &str) -> Result<crates_index::Crate> {
+    let index = crates_index::SparseIndex::new_cargo_default()
+        .context("Failed to open sparse index")?;
+
+    if let Ok(krate) = index.crate_from_cache(name) {
+        return Ok(krate);
+    }
+
+    let request = index
+        .make_cache_request(name)
+        .with_context(|| format!("Failed to build index request for '{name}'"))?
+        .version(ureq::http::Version::HTTP_11)
+        .body(())
+        .context("Failed to build HTTP request body")?;
+
+    let response = ureq::run(request).context("Failed to fetch crate index")?;
+    let (parts, mut body) = response.into_parts();
+    let body = body.read_to_vec().context("Failed to read response body")?;
+    let response = ureq::http::Response::from_parts(parts, body);
+
+    index
+        .parse_cache_response(name, response, true)
+        .context("Failed to parse index response")?
+        .ok_or_else(|| anyhow!("Crate '{name}' not found in registry index"))
+}
+
+/// Query available crate versions in the given range from the sparse index.
 fn query_crate_versions(
     name: &str,
     from: &semver::Version,
     to: &semver::Version,
 ) -> Result<Vec<semver::Version>> {
-    let url = format!("https://crates.io/api/v1/crates/{name}/versions");
-    let mut easy = curl::easy::Easy::new();
-    easy.url(&url)?;
-    easy.follow_location(true)?;
-    easy.useragent("cargo-patch")?;
-    let mut data = Vec::new();
-    {
-        let mut transfer = easy.transfer();
-        transfer.write_function(|d| {
-            data.extend_from_slice(d);
-            Ok(d.len())
-        })?;
-        transfer.perform()?;
-    }
+    let krate = sparse_index_lookup(name)?;
 
-    // Parse the JSON response to extract version numbers
-    // The response has: { "versions": [ { "num": "1.0.0", "yanked": false, ... }, ... ] }
-    let json: serde_json::Value = serde_json::from_slice(&data)
-        .context("Failed to parse crates.io response")?;
-
-    let versions = json["versions"]
-        .as_array()
-        .ok_or_else(|| anyhow!("Unexpected crates.io response format"))?;
-
-    let mut result: Vec<semver::Version> = versions
+    let mut result: Vec<semver::Version> = krate
+        .versions()
         .iter()
-        .filter_map(|v| {
-            let yanked = v["yanked"].as_bool().unwrap_or(true);
-            if yanked {
-                return None;
-            }
-            let num = v["num"].as_str()?;
-            let ver = semver::Version::parse(num).ok()?;
-            if ver > *from && ver <= *to {
-                Some(ver)
-            } else {
-                None
-            }
-        })
+        .filter(|v| !v.is_yanked())
+        .filter_map(|v| semver::Version::parse(v.version()).ok())
+        .filter(|v| v > from && v <= to)
         .collect();
 
     result.sort();
@@ -660,11 +542,6 @@ fn do_patch(
     fs::write(&new_path, data)?;
 
     Ok(patch_type)
-}
-
-fn cleanup_package_dir(_path: &Path, _package: &Package) -> Result<()> {
-    // delete any unused files?
-    Ok(())
 }
 
 fn apply_patches<'a>(
@@ -818,40 +695,40 @@ fn read_to_string(path: &Path) -> Result<String> {
 /// Download patched crate sources and apply patch files.
 ///
 /// Reads patch configuration from `[package.metadata.patch.*]` or
-/// `[workspace.metadata.patch.*]` in Cargo.toml, downloads each crate
-/// to `target/patch/<name>-<version>/`, and applies the listed patches.
+/// `[workspace.metadata.patch.*]` in Cargo.toml, copies each crate from
+/// the local cargo registry cache (or downloads from crates.io if not
+/// cached) to `target/patch/<name>-<version>/`, and applies the listed
+/// patches. Does not require cargo workspace resolution, so it works
+/// even when patched crate paths don't exist yet.
 pub fn patch() -> Result<()> {
     clear_patch_folder()?;
-    let gctx = setup_gctx()?;
-    let _lock = gctx.acquire_package_cache_lock(DownloadExclusive)?;
-    let workspace_path = find_cargo_toml(&PathBuf::from("."))?;
-    let workspace = fetch_workspace(&gctx, &workspace_path)?;
-    let (pkg_set, resolve) = resolve_ws(&workspace)?;
 
-    let custom_metadata = workspace.custom_metadata().into_iter().chain(
-        workspace
-            .members()
-            .flat_map(|member| member.manifest().custom_metadata()),
-    );
-
-    let patches = custom_metadata.flat_map(get_patches);
-    let ids = patches.flat_map(|patch| {
-        get_id(patch.name, &patch.version, &resolve).map(|id| (patch, id))
-    });
-
-    let mut patched = false;
-
-    for (patch, id) in ids {
-        let package = pkg_set.get_one(id)?;
-        let path = copy_package(package)?;
-        cleanup_package_dir(&path, package)?;
-        patched = true;
-        apply_patches(patch.name, patch.patches.into_iter(), &path)?;
-    }
-
-    if !patched {
+    let configs = read_patch_configs()?;
+    if configs.is_empty() {
         println!("No patches found");
+        return Ok(());
     }
+
+    let gctx = setup_gctx()?;
+
+    println!("Fetching {} crate(s) from registry...", configs.len());
+    fetch_crates(&gctx, &configs)?;
+
+    for config in &configs {
+        let patch_dir = find_patch_dir(&config.name, &config.version);
+        let path = fs::canonicalize(&patch_dir)?;
+        let patch_items: Vec<PatchItem<'_>> = config
+            .patch_paths
+            .iter()
+            .map(|p| PatchItem {
+                path: p.as_path(),
+                source: PatchSource::Default,
+            })
+            .collect();
+
+        apply_patches(&config.name, patch_items.into_iter(), &path)?;
+    }
+
     Ok(())
 }
 
@@ -870,16 +747,16 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
     let config = read_patch_config_for(crate_name)?;
     let base_version = config.version.clone();
     let patch_dir = find_patch_dir(crate_name, &base_version);
+    let gctx = setup_gctx()?;
 
     // Remove existing patch dir if present
     if patch_dir.exists() {
         fs::remove_dir_all(&patch_dir)?;
     }
 
-    // Download and extract the base version
-    println!("Downloading {crate_name} {base_version}...");
-    let archive = download_crate_archive(crate_name, &base_version)?;
-    extract_crate_to(&archive, &patch_dir)?;
+    // Fetch the base version from the registry
+    println!("Fetching {crate_name} {base_version}...");
+    fetch_crate_to(&gctx, crate_name, &base_version, &patch_dir)?;
     let path = fs::canonicalize(&patch_dir)?;
 
     // Initialize git repo with a default identity for commits
@@ -904,23 +781,18 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
         let target_ver =
             semver::Version::parse(target_str).context("Invalid target version")?;
 
-        println!("Querying versions between {base_version} and {target_ver}...");
+        println!(
+            "Querying versions between {base_version} and {target_ver}..."
+        );
         let versions = query_crate_versions(crate_name, &base_version, &target_ver)?;
 
         for ver in &versions {
-            println!("Downloading {crate_name} {ver}...");
-            let archive = download_crate_archive(crate_name, ver)?;
-            extract_crate_to(&archive, &path)?;
+            println!("Fetching {crate_name} {ver}...");
+            fetch_crate_to(&gctx, crate_name, ver, &path)?;
             git(&path, &["add", "-A"])?;
             git(
                 &path,
-                &[
-                    "commit",
-                    "--no-verify",
-                    "--allow-empty",
-                    "-m",
-                    &format!("{crate_name} {ver}"),
-                ],
+                &["commit", "--no-verify", "--allow-empty", "-m", &format!("{crate_name} {ver}")],
             )?;
             git(&path, &["tag", &format!("v{ver}")])?;
         }
@@ -955,10 +827,7 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
         match apply_patches(crate_name, std::iter::once(patch_item), &path) {
             Ok(()) => {
                 git(&path, &["add", "-A"])?;
-                git(
-                    &path,
-                    &["commit", "--no-verify", "--allow-empty", "-m", &patch_name],
-                )?;
+                git(&path, &["commit", "--no-verify", "--allow-empty", "-m", &patch_name])?;
             }
             Err(e) => {
                 eprintln!("Warning: failed to apply patch '{patch_name}': {e}");
@@ -977,7 +846,9 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
     if let Some(target_ver) = &target_version {
         println!();
         println!("To rebase patches onto v{target_ver}:");
-        println!("  git rebase --onto v{target_ver} v{base_version} patched",);
+        println!(
+            "  git rebase --onto v{target_ver} v{base_version} patched",
+        );
     }
 
     println!();
@@ -1062,12 +933,7 @@ pub fn save(crate_name: &str) -> Result<()> {
     // List commits from base to HEAD
     let log_output = git(
         &patch_dir,
-        &[
-            "log",
-            "--reverse",
-            "--format=%H %s",
-            &format!("{base}..HEAD"),
-        ],
+        &["log", "--reverse", "--format=%H %s", &format!("{base}..HEAD")],
     )?;
 
     let commits: Vec<(&str, &str)> = log_output
@@ -1105,27 +971,22 @@ pub fn save(crate_name: &str) -> Result<()> {
         // Sanitize the commit message for use as a filename
         let safe_name: String = subject
             .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
             .collect();
         let filename = format!("{:04}-{safe_name}.patch", i + 1);
         let patch_path = output_dir.join(&filename);
 
         // Generate unified diff for this commit
-        let diff_output = git(
-            &patch_dir,
-            &["diff", "--no-prefix", &format!("{hash}~1"), hash],
-        )?;
+        let diff_output = git(&patch_dir, &["diff", "--no-prefix", &format!("{hash}~1"), hash])?;
         fs::write(&patch_path, &diff_output)?;
 
         println!("Saved: {}", patch_path.display());
-        patch_filenames
-            .push(output_dir.join(&filename).to_string_lossy().to_string());
+        patch_filenames.push(
+            output_dir
+                .join(&filename)
+                .to_string_lossy()
+                .to_string(),
+        );
     }
 
     // Update Cargo.toml metadata
@@ -1141,10 +1002,7 @@ pub fn save(crate_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_cargo_toml_patches(
-    crate_name: &str,
-    patch_files: &[String],
-) -> Result<()> {
+fn update_cargo_toml_patches(crate_name: &str, patch_files: &[String]) -> Result<()> {
     let cargo_toml_path = find_cargo_toml(&PathBuf::from("."))?;
     let content = fs::read_to_string(&cargo_toml_path)?;
 
