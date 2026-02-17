@@ -891,6 +891,7 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
         &path,
         &[
             "commit",
+            "--no-verify",
             "--allow-empty",
             "-m",
             &format!("{crate_name} {base_version}"),
@@ -915,6 +916,7 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
                 &path,
                 &[
                     "commit",
+                    "--no-verify",
                     "--allow-empty",
                     "-m",
                     &format!("{crate_name} {ver}"),
@@ -953,7 +955,10 @@ pub fn edit(crate_name: &str, target: Option<&str>) -> Result<()> {
         match apply_patches(crate_name, std::iter::once(patch_item), &path) {
             Ok(()) => {
                 git(&path, &["add", "-A"])?;
-                git(&path, &["commit", "--allow-empty", "-m", &patch_name])?;
+                git(
+                    &path,
+                    &["commit", "--no-verify", "--allow-empty", "-m", &patch_name],
+                )?;
             }
             Err(e) => {
                 eprintln!("Warning: failed to apply patch '{patch_name}': {e}");
@@ -1047,7 +1052,7 @@ pub fn save(crate_name: &str) -> Result<()> {
     let status = git(&patch_dir, &["status", "--porcelain"])?;
     if !status.trim().is_empty() {
         git(&patch_dir, &["add", "-A"])?;
-        git(&patch_dir, &["commit", "-m", "wip"])?;
+        git(&patch_dir, &["commit", "--no-verify", "-m", "wip"])?;
     }
 
     // Find the upstream base (merge-base of HEAD and upstream branch)
